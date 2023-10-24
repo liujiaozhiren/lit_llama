@@ -1,0 +1,433 @@
+# Derived from https://github.com/microsoft/LoRA
+#  ------------------------------------------------------------------------------------------
+#  Copyright (c) Microsoft Corporation. All rights reserved.
+#  Licensed under the MIT License (MIT). See LICENSE in the repo root for license information.
+#  ------------------------------------------------------------------------------------------
+
+r"""
+    Low Ranking Adaptation for LLMs scheme.
+
+             ┌───────────────────┐
+             ┆         h         ┆
+             └───────────────────┘
+                       ▲
+                       |
+                       +
+                    /     \
+    ┌─────────────────┐    ╭───────────────╮     Matrix initialization:
+    ┆                 ┆     \      B      /      B = 0
+    ┆   pretrained    ┆      \    r*d    /       A = N(0, sigma^2)
+    ┆    weights      ┆       ╰─────────╯
+    ┆                 ┆       |    r    |        r - rank
+    ┆   W e R^(d*d)   ┆       | ◀─────▶ |
+    ┆                 ┆       ╭─────────╮
+    └─────────────────┘      /     A     \
+              ▲             /     d*r     \
+               \           ╰───────────────╯
+                \                ▲
+                 \              /
+                  \            /
+             ┌───────────────────┐
+             ┆         x         ┆
+             └───────────────────┘
+
+With LoRA (Low Ranking Adaptation: https://arxiv.org/abs/2106.09685) instead of learning weights of size d*d,
+we can freeze the pretrained weights and instead learn two matrices of size d*r and r*d (they will store weight updates
+for the pretrained weights): the number of parameters in this case will be reduced drastically (depending on the rank of
+course) yet after multiplication of matrices d*r and r*d we will get a matrix d*d which we can sum with frozen
+pretrained weights and thus fine-tune the model.
+
+The goal of this approach is to move weight updates into a separate matrix which is decomposed with
+two matrices of a lower rank.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import math
+from typing import Dict, List
+
+import model_extra as llama
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+
+class LoRALayer():
+    def __init__(
+        self,
+        r: int,
+        lora_alpha: int,
+        lora_dropout: float,
+        merge_weights: bool,
+    ):
+        """
+        Store LoRA specific attributes in a class.
+        """
+        self.r = r
+        self.lora_alpha = lora_alpha
+        # Optional dropout
+        if lora_dropout > 0.:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+        # Mark the weight as unmerged
+        self.merged = False
+        self.merge_weights = merge_weights
+
+
+class MergedLinear(nn.Linear, LoRALayer):
+    # LoRA implemented in a dense layer
+    def __init__(
+        self,
+        # ↓ this part is for pretrained weights
+        in_features: int,
+        out_features: int,
+        # ↓ the remaining part is for LoRA
+        pill_dim: int,
+        enable_pill: List[bool] = [True, True, True],
+        r: int = 0,
+        lora_alpha: int = 1,
+        lora_dropout: float = 0.,
+        enable_lora: List[bool] = [False],
+        fan_in_fan_out: bool = False,
+        merge_weights: bool = True,
+        **kwargs
+    ):
+        """LoRA wrapper around linear class that is used for calculation of q, k and v matrices.
+
+        This class has three weight matrices:
+            1. Pretrained weights are stored as `self.weight` (because of the nn.Linear inheritance)
+            2. LoRA A matrix as `self.lora_A`
+            3. LoRA B matrix as `self.lora_B`
+        Only LoRA's A and B matrices are updated, pretrained weights stay frozen.
+        """
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+                           merge_weights=merge_weights)
+        self.output_embedding_size = out_features//len(enable_lora)
+        assert out_features % len(enable_lora) == 0, \
+            'The length of enable_lora must divide out_features'
+        self.pill_dim = pill_dim
+        self.enable_lora = enable_lora
+        self.enable_pill = enable_pill
+        self.fan_in_fan_out = fan_in_fan_out
+
+        # Actual trainable parameters
+        # To better understand initialization let's imagine that we have such parameters:
+        # ⚬ in_features: 128 (embeddings_size)
+        # ⚬ out_features: 384 (3 * embedding_size)
+        # ⚬ r: 2
+        # ⚬ enable_lora: [True, False, True]
+        if r > 0 and any(enable_lora):
+            self.lora_A = nn.Parameter(
+                self.weight.new_zeros((r * sum(enable_lora), in_features)))  # (4, 128)
+            self.lora_B = nn.Parameter(
+                self.weight.new_zeros((out_features // len(enable_lora) * sum(enable_lora), r))  # (256, 2)
+            )  # weights for Conv1D with groups=sum(enable_lora)
+
+            # eat extra pills ?
+            if pill_dim > 0 and any(enable_pill):
+                self.pill_param = nn.Parameter(
+                    self.weight.new_zeros((pill_dim * sum(enable_pill), pill_dim)))  # (pill_dim*3, pill_dim)
+
+            self.scaling = self.lora_alpha / self.r
+
+            # Freezing the pre-trained weight matrix
+            self.weight.requires_grad = False  # (384, 128)
+
+            # Compute the indices
+            # Indices are needed to properly pad weight updates with zeros. If we want to fine-tune queries and values,
+            # but not keys, then the weights update should be:
+            #
+            # [[ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW,],
+            #  [....................................],
+            #  [ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW,]]
+            #      ↑              ↑            ↑
+            # ________________________________________
+            # | query         | key       | value    |
+            # ----------------------------------------
+            self.lora_ind = self.weight.new_zeros(
+                (out_features, ), dtype=torch.bool
+            ).view(len(enable_lora), -1)  # (3, 128)
+            self.lora_ind[enable_lora, :] = True  # (3, 128)
+            self.lora_ind = self.lora_ind.view(-1)  # (384,)
+
+            self.pill_ind = self.weight.new_zeros(
+                (len(enable_pill)*pill_dim,), dtype=torch.bool
+            ).view(len(enable_pill), -1)  # (3, pill_dim)
+            self.pill_ind[enable_pill, :] = True  # (3, pill_dim)
+            self.pill_ind = self.pill_ind.view(-1)  # (3*pill_dim)
+
+        self.reset_parameters()
+        if fan_in_fan_out:
+            self.weight.data = self.weight.data.T
+
+    def reset_parameters(self):
+        """Reset all the weights, even including pretrained ones."""
+        nn.Linear.reset_parameters(self)
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            # Wondering why 'a' is equal to math.sqrt(5)?: https://github.com/pytorch/pytorch/issues/15314
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def zero_pad(self, x: torch.Tensor) -> torch.Tensor:
+        """Properly pad weight updates with zeros.
+
+        If, based on `self.enable_lora`, we want to fine-tune queries and values, but not keys,
+        then the weights update should be:
+
+        [[ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW,],
+         [....................................],
+         [ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW,]]
+            ↑              ↑            ↑
+        ________________________________________
+        | query         | key       | value    |
+        ----------------------------------------
+
+        Args:
+            x: tensor with weights update that will be padded with zeros if necessary
+
+        Returns:
+            A tensor with weight updates and zeros for deselected q, k or v
+        """
+        x = x.transpose(0, 1)
+        result = x.new_zeros((*x.shape[:-1], self.out_features))  # (64, 64, 384)
+        result = result.view(-1, self.out_features)  # (4096, 384)
+        result[:, self.lora_ind] = x.reshape(
+            -1, self.out_features // len(self.enable_lora) * sum(self.enable_lora)
+        )  # (4096, 256)
+        return result.view((*x.shape[:-1], self.out_features)).transpose(0, 1)  # (64, 64, 384)
+
+    def pill_pad(self, pill: torch.Tensor) -> torch.Tensor:
+        if sum(self.enable_pill) == len(self.enable_pill):
+            return pill  # (64, 64, out_pill_dim)
+        pill = pill.transpose(0, 1)
+        out_pill_dim = self.pill_dim * len(self.enable_pill)
+        result = pill.new_zeros((*pill.shape[:-1], out_pill_dim))  # (64, 64, out_pill_dim)
+        result = result.view(-1, out_pill_dim)  # (4096, out_pill_dim)
+        result[:, self.pill_ind] = pill.reshape(
+            -1, self.pill_dim * sum(self.enable_pill)
+        )  # (4096, 3 * pill_dim)
+        return result.view((*pill.shape[:-1], out_pill_dim)).transpose(0, 1)  # (64, 64, out_pill_dim)
+
+    def take_pill(self, origin: torch.Tensor, pill: torch.Tensor) -> torch.Tensor:
+        shape_lora = (*origin.shape[:-1], len(self.enable_lora), self.output_embedding_size)
+        shape_pill = (*pill.shape[:-1], len(self.enable_pill), self.pill_dim)
+        t_lora = origin.view(shape_lora)
+        t_pill = pill.view(shape_pill)
+        result = torch.cat((t_lora, t_pill), dim=-1)
+        return result.view((*result.shape[:-2], -1))
+
+    # def train(self, mode: bool = True):
+    #     def T(w):
+    #         return w.T if self.fan_in_fan_out else w
+    #
+    #     nn.Linear.train(self, mode)
+    #
+    #     should = self.merged if mode else not self.merged
+    #
+    #     if self.merge_weights and should:
+    #         if self.r > 0 and any(self.enable_lora):
+    #             delta_w = F.conv1d(
+    #                 self.lora_A.data.unsqueeze(0),   # (4, 128) -> (1, 4, 128)
+    #                 self.lora_B.data.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
+    #                 groups=sum(self.enable_lora)
+    #             ).squeeze(0)  # (1, 4, 128) @ (256, 2, 1) -> (1, 256, 128) -> (256, 128)
+    #             # -1: W = W - delta_W (unmerge), +1: W = W + delta_W (merge)
+    #             sign = -1 if mode else 1
+    #             self.weight.data += sign * self.zero_pad(T(delta_w * self.scaling)) # (256, 128) after zero_pad (384, 128)
+    #         self.merged = not mode
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+
+        def T(w):
+            return w.T if self.fan_in_fan_out else w
+
+        # if self.merged:
+        #     origin = F.linear(x[..., :self.in_features], T(self.weight), bias=self.bias)
+        #     pill = F.linear(x[..., self.in_features:], self.pill_param)
+        #     return origin, pill
+        # else:
+        # `F.linear` automatically transposes the second argument (T(self.weight) in our case)
+        origin = F.linear(x[:, :, :self.in_features], T(self.weight), bias=self.bias)
+        # (64, 64, 128) @ (384, 128) -> (64, 64, 384)
+        if self.r > 0:
+            after_A = F.linear(self.lora_dropout(x[:, :, :self.in_features]), self.lora_A)
+            # (64, 64, 128) @ (4, 128) -> (64, 64, 4)
+            pill = F.linear(self.lora_dropout(x[:, :, self.in_features:]), self.pill_param)
+            # (64, 64, pill_dim) @ (pill_dim, pill_dim) -> (64, 64, 4)
+            after_B = F.conv1d(
+                after_A.transpose(-2, -1),  # (64, 64, 4) -> (64, 4, 64) (Batch_Size,In_Channel,Length)
+                self.lora_B.unsqueeze(-1),  # (256, 2) -> (256, 2, 1) (Out_Channel,In_Channel/Group,Kernel_Size)
+                groups=sum(self.enable_lora)
+            ).transpose(-2, -1)  # (64, 4, 64) @ (256, 2, 1) -> (64, 256, 64) -> (64, 64, 256)
+            origin += self.zero_pad(after_B) * self.scaling  # (64, 64, 256) after zero_pad (64, 64, 384)
+        pill = self.pill_pad(pill)
+        # result = self.take_pill(origin, pill)
+        return origin, pill
+
+
+def mark_only_lora_pill_as_trainable(model: nn.Module, bias: str = 'none') -> None:
+    """Freeze all modules except LoRA's and depending on 'bias' value unfreezes bias weights.
+
+    Args:
+        model: model with LoRA layers
+        bias:
+            ``"none"``: all bias weights will be frozen,
+            ``"lora_only"``: only bias weight for LoRA layers will be unfrozen,
+            ``"all"``: all bias weights will be unfrozen.
+
+    Raises:
+        NotImplementedError: if `bias` not in ["none", "lora_only", "all"]
+    """
+    # freeze all layers except LoRA's
+    for n, p in model.named_parameters():
+        if 'lora_' not in n and 'pill' not in n:
+            p.requires_grad = False
+
+    # depending on the `bias` value unfreeze bias weights
+    if bias == 'none':
+        return
+    elif bias == 'all':
+        for n, p in model.named_parameters():
+            if 'bias' in n:
+                p.requires_grad = True
+    elif bias == 'lora_only':
+        for m in model.modules():
+            if isinstance(m, LoRALayer) and \
+                hasattr(m, 'bias') and \
+                m.bias is not None:
+                    m.bias.requires_grad = True
+    elif bias == 'lora_pill':
+        for m in model.modules():
+            if isinstance(m, LoRALayer) and \
+                hasattr(m, 'bias') and \
+                m.bias is not None:
+                    m.bias.requires_grad = True
+    else:
+        raise NotImplementedError
+
+
+def lora_pill_state_dict(model: nn.Module, bias: str = 'none') -> Dict[str, torch.Tensor]:
+    """Return state_dict with weights of LoRA's A and B matrices and with biases depending on the `bias` value.
+
+    Args:
+        model: model with LoRA layers
+        bias:
+            ``"none"``: state dict will not store bias weights,
+            ``"lora_only"``: state dict will store bias weights only from LoRA layers,
+            ``"all"``: state dict will store all bias weights.
+
+    Returns:
+        Weights and biases of LoRA layers
+
+    Raises:
+        NotImplementedError: if `bias` not in ["none", "lora_only", "all"]
+    """
+    my_state_dict = model.state_dict()
+    if bias == 'none':
+        return {k: my_state_dict[k] for k in my_state_dict if 'lora_' in k or 'pill' in k}
+    elif bias == 'all':
+        return {k: my_state_dict[k] for k in my_state_dict if 'lora_' in k or 'pill' in k or 'bias' in k}
+    elif bias == 'lora_only':
+        to_return = {}
+        for k in my_state_dict:
+            if 'lora_' in k:
+                to_return[k] = my_state_dict[k]
+                bias_name = k.split('lora_')[0]+'bias'
+                if bias_name in my_state_dict:
+                    to_return[bias_name] = my_state_dict[bias_name]
+        return to_return
+    else:
+        raise NotImplementedError
+
+
+@dataclass
+class LoRAConfig:
+    r: float = 0.0
+    alpha: float = 1.0
+    dropout: float = 0.0
+
+
+class CausalSelfAttention(llama.CausalSelfAttention):
+    lora_config = None
+
+    def __init__(self, config: llama.LLaMAExtraConfig) -> None:
+        """Causal self-attention with calculating qkv matrices with a single matrix* and Low Ranking Adaptation for
+        parameter-efficient fine-tuning.
+
+        *Instead of creating multiple heads and concatenating the result (in addition to creating separate matrices for
+        query, key and value for each head) we can do this in a single pass with a single weight matrix.
+
+        Args:
+            config:
+                ``"block_size"``: size of the context of the model,
+                ``"vocab_size"``: number of unique tokens,
+                ``"padded_vocab_size"``: padded size of the vocabulary to the nearest multiple of 64 (leads to a greater performance),
+                ``"n_layer"``: number of transformer blocks (self-attention + MLP),
+                ``"n_head"``: number of heads in multi-head attention mechanism,
+                ``"n_embd"``: size of the embedding: vector representation of each token.
+        """
+        # Skip the parent class __init__ altogether and replace it to avoid
+        # useless allocations
+        nn.Module.__init__(self)
+        assert config.n_embd % config.n_head == 0
+
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = MergedLinear(
+            in_features=config.n_embd,
+            out_features=3 * config.n_embd,
+            pill_dim=2,
+            enable_pill=[True, True, True],
+            r=self.lora_config.r,
+            lora_alpha=self.lora_config.alpha,
+            lora_dropout=self.lora_config.dropout,
+            enable_lora=[True, False, True],
+            fan_in_fan_out = False,
+            merge_weights=True,
+            bias=False)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.pill_proj = nn.Linear(config.s_embd * config.n_head,
+                                   config.s_embd, bias=False)
+        # regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.s_embd = config.s_embd
+        self.block_size = config.block_size
+        self.rope_cache = None
+
+
+@contextmanager
+def lora_pill(r, alpha, dropout, enabled: bool = True):
+    """Apply context manager under which you can instantiate the model with LoRA.
+
+    In a nutshell the code inside this function forces to use LoRA variant of causal self-attention
+    instead of the original one (without LoRA).
+
+    Args:
+        r: rank of the weight update matrices. To make sense of using LoRA the rank should be smaller than the rank of
+            the weights of the model.  The rank can be as low as 1: https://arxiv.org/pdf/2106.09685.pdf (section 7.2)
+        alpha: alpha is needed for scaling updates as alpha/r
+            "This scaling helps to reduce the need to retune hyperparameters when we vary r"
+            https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
+        dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+        enabled: enables/disables LoRA
+    """
+    if not enabled:
+        yield
+        return
+
+    CausalSelfAttention.lora_config = LoRAConfig(r=r, alpha=alpha, dropout=dropout)
+    # when entering context manager replace link to causal self-attention class from original
+    # to a variant with LoRA
+    causal_self_attention = llama.CausalSelfAttention
+    llama.CausalSelfAttention = CausalSelfAttention
+    yield
+    # when exiting context manager - restore link to original causal self-attention class
+    llama.CausalSelfAttention = causal_self_attention
+
+    CausalSelfAttention.lora_config = None
