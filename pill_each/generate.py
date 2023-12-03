@@ -1,4 +1,3 @@
-
 import sys
 import time
 import warnings
@@ -9,33 +8,36 @@ import lightning as L
 import torch
 import random
 
+from pill_each.spatial_lora import lora_pill
+
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from model_extra import LLaMA_extra, LLaMAExtraConfig
-from lora_pill import lora_pill
+from model_spatial import LLaMA_spatial
+
 from lit_llama.utils import EmptyInitOnDevice, lazy_load, llama_model_lookup
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 
-#from datasets import load_dataset
+# from datasets import load_dataset
 
 lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 
+
 @torch.no_grad()
 def generate(
-    model: LLaMA_extra,
-    idx: torch.Tensor,
-    spatial_pill: torch.Tensor,
-    max_new_tokens: int,
-    *,
-    max_seq_length: Optional[int] = None,
-    temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    eos_id: Optional[int] = None,
+        model: LLaMA_spatial,
+        idx: torch.Tensor,
+        spatial_pill: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        max_seq_length: Optional[int] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        eos_id: Optional[int] = None,
 ) -> (torch.Tensor, torch.Tensor):
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
 
@@ -62,7 +64,9 @@ def generate(
     empty[:T] = idx
     idx = empty
     input_pos = torch.arange(0, T, device=device)
-
+    spatial_pill_ = spatial_pill
+    spatial_pill = torch.zeros((T_new, model.config.s_embd), dtype=spatial_pill_.dtype, device=device)
+    spatial_pill[:T] = spatial_pill_
     if idx.device.type == "xla":
         import torch_xla.core.xla_model as xm
 
@@ -93,7 +97,7 @@ def generate(
 
         # concatenate the new generation
         idx = idx.index_copy(0, input_pos, idx_next)
-        spatial_pill = spatial_pill.index_copy(0, input_pos, space)
+        spatial_pill = spatial_pill.index_copy(0, input_pos, space[0, -1:, :])
 
         # if <eos> token is triggered, return the output (stop generation)
         if idx_next == eos_id:
@@ -148,7 +152,7 @@ def generate_main(
         with EmptyInitOnDevice(
                 device=fabric.device, dtype=dtype, quantization_mode=quantize
         ), lora_pill(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True):
-            model = LLaMA_extra.from_name(name)
+            model = LLaMA_spatial.from_name(name)
             # 1. Load the pretrained weights
             model.load_state_dict(pretrained_checkpoint, strict=False)
             # 2. Load the fine-tuned lora weights
@@ -161,13 +165,12 @@ def generate_main(
 
     test_data = torch.load(dataset_dir)
     poi_list = torch.load(poi_dir)
-
     command = ""
     while command != "quit":
         try:
             ix = int(command)
         except:
-            ix = random.randint(0, len(test_data)-1)
+            ix = random.randint(0, len(test_data) - 1)
             print("random index: {}".format(ix))
         data = test_data[ix]
         sentence = data["sentence"]
@@ -177,7 +180,7 @@ def generate_main(
         instruction = "Given a user's visited places sequence as follows, " \
                       "predict which place the user will visit next: "
 
-        prompt_sentence = generate_sentence(instruction, poi_token[:len(poi_token)//2],
+        prompt_sentence = generate_sentence(instruction, poi_token[:len(poi_token) // 2],
                                             poi_list, tokenizer, device)
         spatial_addition = torch.stack(spatial_addition[:len(prompt_sentence)]).to(device)
         output, coords = generate_response(model, prompt_sentence, spatial_addition, tokenizer)
