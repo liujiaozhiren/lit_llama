@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from lit_llama.utils import lazy_load
 # from pill_each.model_spatial import LLaMA_spatial
-from model_spatial import LLaMA_spatial
+from model_spatial import LLaMA_spatial, LLaMASpatialConfig
 from pill_each.prepare import prepare, POI_Find_Dict
 from pill_each.spatial_lora import lora_pill, mark_only_lora_and_spatial_as_trainable, lora_spatial_state_dict
 
@@ -73,24 +73,27 @@ def main(
         os.makedirs(out_dir, exist_ok=True)
 
     # train_data, val_data = load_datasets(data_dir=data_dir)
-    train_data = torch.load(trainset_dir)
-    valid_data = torch.load(validset_dir)
+    data = torch.load(trainset_dir)
+    data.extend(torch.load(validset_dir))
     poi_list = torch.load(poi_dir)
     poi_finder = POI_Find_Dict(poi_list)
     # config = LLaMAConfig.from_name("7B")
     # config.block_size = max_seq_length
     # pretrained_checkpoint = lazy_load(checkpoint_path)
     # lora_checkpoint = lazy_load(lora_path)
+    llama_config = LLaMASpatialConfig.from_name("7B")
+    tokenizer = Tokenizer(Path(tokenizer_path))
+    data, tmp = prepare(data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
+    #valid_data, _ = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
+    train_data, valid_data = data[:int(len(data)*0.8)], data[int(len(data)*0.8):]
+    llama_config.start_poi_idx, llama_config.patch_len = tmp
     with lazy_load(checkpoint_path) as pretrained_checkpoint, lazy_load(lora_path) as lora_checkpoint:
         with fabric.init_module(), lora_pill(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True):
-            model = LLaMA_spatial.from_name("7B")
+            model = LLaMA_spatial(llama_config)
             # strict=False because missing keys due to LoRA weights not contained in checkpoint state
             model.load_state_dict(pretrained_checkpoint, strict=False)
             model.load_state_dict(lora_checkpoint, strict=False)
-    tokenizer = Tokenizer(Path(tokenizer_path))
     mark_only_lora_and_spatial_as_trainable(model)
-    train_data = prepare(train_data, poi_list, tokenizer, padded_vocab_size=model.config.padded_vocab_size)
-    valid_data = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=model.config.padded_vocab_size)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     model, optimizer = fabric.setup(model, optimizer)
     train(fabric, model, optimizer, train_data, valid_data, tokenizer, out_dir, poi_finder)
@@ -124,10 +127,11 @@ def train(
                     param_group['lr'] = lr
             t0 = time.time()
 
-            lang_input, lang_label, spa_input, spa_label, spa_mask, trainable_mask = get_batch(fabric, train_data)
+            lang_input, lang_label, spa_input, spa_label, spa_mask, trainable_mask,\
+                raw_spatial, poi_idx = get_batch(fabric, train_data)
             with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
-                logits, coord = model(lang_input, spa_input, 256)
-                loss_lang, loss_spa = merged_loss_fn(logits, coord, lang_label, spa_label, spa_mask, trainable_mask)
+                logits, coord = model(lang_input, spa_input, raw_spatial, poi_idx, 256)
+                loss_lang, loss_spa = merged_loss_fn(logits, coord, lang_label, raw_spatial, spa_mask, trainable_mask)
                 loss = loss_lang + loss_spa
                 fabric.backward(loss / gradient_accumulation_iters)
                 optimizer.step()
@@ -187,8 +191,8 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: List, tokenizer
         for k in tq:
             iter = range(k * infer_batch_size, min((k + 1) * infer_batch_size, len(val_data)))
             lang_input, lang_label, spa_input, spa_label, spa_mask, \
-                trainable_mask, valid_data = get_batch(fabric, val_data,train=False,iter=iter)
-            logits, coord = model(lang_input, spa_input, 256)
+                trainable_mask, valid_data, raw_spatial,poi_idx = get_batch(fabric, val_data,train=False,iter=iter)
+            logits, coord = model(lang_input, spa_input, raw_spatial,poi_idx, 256)
             hr10, hr50, total = valid_accuracy(valid_data, logits, coord, tokenizer, poi_finder)
             total_base += total
             hr_10 += hr10
@@ -291,10 +295,14 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None):
     spatial_label = [data[i]["spatial_labels"].type(torch.float32) for i in ix]
     spatial_mask = [data[i]["spatial_masks"].type(torch.bool) for i in ix]
     trainable_mask = [data[i]["trainable_masks"].type(torch.bool) for i in ix]
+    raw_spatial = [data[i]["raw_spatial"].type(torch.float32) for i in ix]
+    poi_idx = [data[i]["spatial_start_idx"].type(torch.int64) for i in ix]
+
+
     if not train:
         infer_poi = [data[i]["infer_poi"] for i in ix]
-        pos_start_idx = [data[i]["pos_start_idx"] for i in ix]
-        patch_len = [data[i]["patch_len"] for i in ix]
+        # pos_start_idx = [data[i]["pos_start_idx"] for i in ix]
+        # patch_len = [data[i]["patch_len"] for i in ix]
         poi_num = [data[i]["poi_num"] for i in ix]
 
     max_len = max(len(s) for s in language_input)
@@ -315,16 +323,18 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None):
         [pad_right(x, pad_value=torch.zeros(2, dtype=x.dtype, device=x.device)) for x in spatial_label])
     sm = torch.stack([pad_right(x, pad_value=True) for x in spatial_mask])
     tm = torch.stack([pad_right(x, pad_value=True) for x in trainable_mask])
-    language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask = fabric.to_device(
-        (li.pin_memory(), ll.pin_memory(), si.pin_memory(), sl.pin_memory(), sm.pin_memory(), tm.pin_memory()))
+    rs = torch.stack(raw_spatial)
+    language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask, raw_spatial = \
+        fabric.to_device((li.pin_memory(), ll.pin_memory(), si.pin_memory(), sl.pin_memory(), sm.pin_memory(),
+                          tm.pin_memory(), rs.pin_memory()))
     if train:
-        return language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask
+        return language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask, raw_spatial, poi_idx
     valid_data = {}
     valid_data['infer_poi'] = infer_poi
-    valid_data['pos_start_idx'] = pos_start_idx
-    valid_data['patch_len'] = patch_len
+    # valid_data['pos_start_idx'] = pos_start_idx
+    # valid_data['patch_len'] = patch_len
     valid_data['poi_num'] = poi_num
-    return language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask, valid_data
+    return language_input, language_label, spatial_input, spatial_label, spatial_mask, trainable_mask, valid_data, raw_spatial, poi_idx
 
 
 if __name__ == "__main__":

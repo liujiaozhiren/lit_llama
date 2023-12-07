@@ -42,6 +42,9 @@ class LLaMASpatialConfig:
     r: float = 0.0
     alpha: float = 1.0
     dropout: float = 0.0
+    s_code_layer = 3
+    start_poi_idx = None
+    patch_len = None
 
     def __post_init__(self):
         if self.padded_vocab_size is None:
@@ -87,6 +90,46 @@ class SpatialBlock(nn.Module):
         return x, s, new_kv_cache
 
 
+class Num_Coder(nn.Module):
+    def __init__(self, config: LLaMASpatialConfig) -> None:
+        super().__init__()
+        self.config = config
+        if config.patch_len is not None:
+            if type(config.patch_len) == int:
+                self.fixed_len = config.patch_len
+                self.num_encoder = nn.Linear(2, config.patch_len * config.s_embd)
+                self.num_decoder = nn.Linear(config.patch_len * config.s_embd, 2)
+            else:
+                raise Exception("patche_len not support")
+        else:
+            self.fixed_len = None
+            self.num_encoder = nn.GRU(config.s_embd, config.s_embd, config.s_code_layer)
+            self.num_decoder = nn.GRU(config.s_embd, config.s_embd, config.s_code_layer)
+        self.start_poi_idx = config.start_poi_idx
+
+    def code(self, raw_spatial, spatial_tensor, poi_idx=None):
+        if self.fixed_len is not None:
+            B, L, _ = raw_spatial.size()
+            spa = self.num_encoder(raw_spatial).view(B, self.fixed_len * L, self.config.s_embd)
+            spatial_tensor[:, self.start_poi_idx:, :] = spa[:, :-1, :]
+
+        else:
+            # TODO: implement can enlarge patching
+            raise Exception("not support GRU")
+        return spatial_tensor
+
+    def decode(self, coord, poi_idx=None):
+        if self.fixed_len is not None:
+            spa = coord[:, self.start_poi_idx - 1:, :]
+            B, L, _ = spa.size()
+            spa = self.num_decoder(spa.view(B, -1, self.config.s_embd * self.fixed_len))
+
+        else:
+            # TODO: implement can enlarge patching
+            raise Exception("not support GRU")
+        return spa
+
+
 class LLaMA_spatial(nn.Module):
     def __init__(self, config: LLaMASpatialConfig) -> None:
         super().__init__()
@@ -106,6 +149,7 @@ class LLaMA_spatial(nn.Module):
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[MaskCache] = None
         self.kv_caches: List[KVCache] = []
+        self.spatial_coder = Num_Coder(config=config)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -114,8 +158,8 @@ class LLaMA_spatial(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
 
     def forward(
-            self, idx: torch.Tensor, spatial_addition: torch.Tensor = None,
-            max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+            self, idx: torch.Tensor, spatial_addition: torch.Tensor = None, raw_spatial: torch.Tensor = None,
+            poi_idx: list = None, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
         s = None
@@ -135,6 +179,7 @@ class LLaMA_spatial(nn.Module):
             rope = self.rope_cache.index_select(0, input_pos)
             mask = self.mask_cache.index_select(2, input_pos)
             mask = mask[:, :, :, :max_seq_length]
+            spatial_addition = self.spatial_coder.code(raw_spatial, spatial_addition, poi_idx)
         else:
             rope = self.rope_cache[:T]
             mask = self.mask_cache[:, :, :T, :T]
@@ -171,6 +216,8 @@ class LLaMA_spatial(nn.Module):
             # s = x[..., self.config.n_embd:]
             logits = self.lm_head(w)  # (b, t, vocab_size)
             coord = self.spatial_head(s)
+            if input_pos is not None:
+                coord = self.spatial_coder.decode(coord)
             return logits, coord
         else:
             logits = self.lm_head(x)  # (b, t, vocab_size)
