@@ -7,6 +7,7 @@ from typing import Optional
 import lightning as L
 import torch
 import random
+import ahocorasick
 
 from pill_each.spatial_lora import lora_pill
 
@@ -188,6 +189,35 @@ def generate_main(
         command = input()
 
 
+class WordExtract:
+    def __init__(self, keywords):
+        self.keywords = keywords  # type(list)  list id equals to keyword id
+        self.automat = self.build_automat()
+
+    def build_automat(self):
+        auto = ahocorasick.Automaton()
+        for index, keyword in enumerate(self.keywords):
+            auto.add_word(keyword, (index, keyword))
+        auto.make_automaton()
+        return auto
+
+    def extract_keywords(self, text):
+        keyword_matches = set()
+        for end_index, (keyword_index, original_keyword) in self.automat.iter(text):
+            start_index = end_index - len(original_keyword) + 1
+            keyword_matches.add((keyword_index, start_index, end_index))
+        return keyword_matches
+
+
+def extract_sample():
+    sample_text = "这是一个示例文本，其中包含一些关键词，如Python、关键字、文本处理等如Python。"
+    sample_keywords = ["关键词", "Python", "文本处理"]
+
+    WE = WordExtract(sample_keywords)
+    result = WE.extract_keywords(sample_text)  # extract word
+    print("文本中的关键词:", result)
+
+
 if __name__ == "__main__":
     from jsonargparse import CLI
 
@@ -203,3 +233,4 @@ if __name__ == "__main__":
         message="MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization",
     )
     CLI(generate_main)
+

@@ -14,8 +14,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
-from spatial_pill.model import LLaMAConfig
-
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
@@ -35,7 +33,7 @@ class LLaMASpatialConfig:
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
-    s_embd: int = 2
+    s_embd: int = 4
     s_head: int = 1
     n_pill_s: float = 0.0
     s_pill_n: float = 0.0
@@ -45,6 +43,10 @@ class LLaMASpatialConfig:
     s_code_layer = 3
     start_poi_idx = None
     patch_len = None
+    bbox = {"lon_min": 0.0, "lat_min": 0.0, "lon_max": 0.0, "lat_max": 0.0}
+
+    use_repeat = False
+    use_rnn = False
 
     def __post_init__(self):
         if self.padded_vocab_size is None:
@@ -90,7 +92,7 @@ class SpatialBlock(nn.Module):
         return x, s, new_kv_cache
 
 
-class Num_Coder(nn.Module):
+class Num_Coder(nn.Module):  # this version is for extracting an entire patch
     def __init__(self, config: LLaMASpatialConfig) -> None:
         super().__init__()
         self.config = config
@@ -107,27 +109,103 @@ class Num_Coder(nn.Module):
             self.num_decoder = nn.GRU(config.s_embd, config.s_embd, config.s_code_layer)
         self.start_poi_idx = config.start_poi_idx
 
-    def code(self, raw_spatial, spatial_tensor, poi_idx=None):
-        if self.fixed_len is not None:
+    def encode(self, raw_spatial, spatial_tensor, spatial_scope=None):
+        if self.fixed_len is not None and spatial_scope is None:
             B, L, _ = raw_spatial.size()
             spa = self.num_encoder(raw_spatial).view(B, self.fixed_len * L, self.config.s_embd)
             spatial_tensor[:, self.start_poi_idx:, :] = spa[:, :-1, :]
-
+        elif spatial_scope is not None:
+            ...
         else:
             # TODO: implement can enlarge patching
             raise Exception("not support GRU")
         return spatial_tensor
 
-    def decode(self, coord, poi_idx=None):
-        if self.fixed_len is not None:
+    def decode(self, coord, spatial_scope=None):
+        if self.fixed_len is not None and spatial_scope is None:
             spa = coord[:, self.start_poi_idx - 1:, :]
             B, L, _ = spa.size()
             spa = self.num_decoder(spa.view(B, -1, self.config.s_embd * self.fixed_len))
-
+        elif spatial_scope is not None:
+            ...
         else:
             # TODO: implement can enlarge patching
             raise Exception("not support GRU")
         return spa
+
+
+class SpatialCoder(nn.Module):  # jn: this version is for extracting last output of a patch
+    def __init__(self, config: LLaMASpatialConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.start_poi_idx = config.start_poi_idx
+        self.max_word_len = config.patch_len
+        self.s_embd = config.s_embd
+        self.use_repeat = config.use_repeat
+        self.use_rnn = config.use_rnn
+
+        # init encoder
+        if self.use_repeat:
+            self.spatial_encoder = nn.Linear(2, self.s_embd)
+        else:
+            self.spatial_encoder = nn.Linear(2, self.max_word_len * self.s_embd)
+
+        if self.use_rnn:
+            self.spatial_rnn = nn.LSTM(self.s_embd, self.s_embd, self.config.s_code_layer, batch_first=True)
+        else:
+            self.spatial_rnn = None
+
+        # init decoder
+        self.spatial_decoder = nn.Linear(self.s_embd, 2)
+
+    def form_spatial_sentence(self, spatial_tensor, spatial_scope):
+        B, L, _, _ = spatial_tensor.size()
+        word_lens = spatial_scope[:, :, 1] - spatial_scope[:, :, 0]
+        index_matrix = torch.arange(self.max_word_len, device=spatial_tensor.device).repeat(B, L, 1)
+        mask = index_matrix < word_lens.unsqueeze(-1)
+        extracted = spatial_tensor[mask]
+        sentence_lens = word_lens.sum(1)
+        slice_length = sentence_lens.max()
+        places = torch.cumsum(sentence_lens, dim=0).roll(shifts=1, dims=0)
+        places[0] = 0
+        order_number = torch.arange(slice_length).to(spatial_tensor.device).view(1, -1) + places.unsqueeze(1)
+        mask = torch.arange(slice_length, device=spatial_tensor.device).repeat(B, 1) >= sentence_lens.unsqueeze(-1)
+        order_number[mask] = extracted.shape[0]
+        row_of_zeros = torch.zeros(1, extracted.shape[1], device=spatial_tensor.device)
+        extracted = torch.cat([extracted, row_of_zeros], dim=0)
+        ordered = extracted[order_number]
+        return ordered
+
+    def encode(self, raw_spatial, spatial_scope=None):
+        B, L, _ = raw_spatial.size()
+        if self.use_repeat:  # repeat method
+            spatial_tensor = self.spatial_encoder(raw_spatial).unsqueeze(1).repeat(1, 1, self.max_word_len, 1)
+        else:  # generate a max length
+            spatial_tensor = self.spatial_encoder(raw_spatial).view(B, L, self.max_word_len, self.s_embd)
+
+        if self.use_rnn:
+            spatial_tensor = spatial_tensor.view(-1, self.max_word_len, self.s_embd)
+            spatial_tensor, _ = self.spatial_rnn(spatial_tensor)
+            spatial_tensor = spatial_tensor.view(B, L, self.max_word_len, self.s_embd)
+
+        spatial_tensor = self.form_spatial_sentence(spatial_tensor, spatial_scope)
+        spatial_tensor = torch.cat([torch.zeros([B, self.start_poi_idx, self.s_embd], device=spatial_tensor.device),
+                                    spatial_tensor], dim=1)
+        # need to remove the last node and add instruction paddings
+        return spatial_tensor
+
+    def decode(self, spatial_tensor, spatial_scope=None):
+        if spatial_scope is not None:  # length not fixed
+            index = torch.arange(spatial_tensor.shape[0]).unsqueeze(1)
+            last_nodes = spatial_scope[:, :, 1] - 1
+            last_nodes[last_nodes < 0] = 0
+            spatial_tensor = spatial_tensor[index, last_nodes]
+            coord = self.spatial_decoder(spatial_tensor)
+        else:  # length fixed
+            spatial_tensor = spatial_tensor[:, self.start_poi_idx - 1:, :]
+            spatial_tensor = spatial_tensor[:, ::self.max_word_len, :]  # sample by fixed length
+            coord = self.spatial_decoder(spatial_tensor)
+        return coord
 
 
 class LLaMA_spatial(nn.Module):
@@ -149,7 +227,7 @@ class LLaMA_spatial(nn.Module):
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[MaskCache] = None
         self.kv_caches: List[KVCache] = []
-        self.spatial_coder = Num_Coder(config=config)
+        self.spatial_coder = SpatialCoder(config=config)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -158,8 +236,8 @@ class LLaMA_spatial(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
 
     def forward(
-            self, idx: torch.Tensor, spatial_addition: torch.Tensor = None, raw_spatial: torch.Tensor = None,
-            poi_idx: list = None, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+            self, idx: torch.Tensor, raw_spatial: torch.Tensor = None, spatial_scope: torch.Tensor = None,
+            max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
         s = None
@@ -175,11 +253,13 @@ class LLaMA_spatial(nn.Module):
         if self.mask_cache is None:
             self.mask_cache = self.build_mask_cache(idx)
 
+        spatial_addition = self.spatial_coder.encode(raw_spatial, spatial_scope)
+        assert idx.shape == spatial_addition.shape[:2]
+
         if input_pos is not None:
             rope = self.rope_cache.index_select(0, input_pos)
             mask = self.mask_cache.index_select(2, input_pos)
             mask = mask[:, :, :, :max_seq_length]
-            spatial_addition = self.spatial_coder.code(raw_spatial, spatial_addition, poi_idx)
         else:
             rope = self.rope_cache[:T]
             mask = self.mask_cache[:, :, :T, :T]
@@ -216,8 +296,7 @@ class LLaMA_spatial(nn.Module):
             # s = x[..., self.config.n_embd:]
             logits = self.lm_head(w)  # (b, t, vocab_size)
             coord = self.spatial_head(s)
-            if input_pos is not None:
-                coord = self.spatial_coder.decode(coord)
+            coord = self.spatial_coder.decode(coord, spatial_scope)
             return logits, coord
         else:
             logits = self.lm_head(x)  # (b, t, vocab_size)

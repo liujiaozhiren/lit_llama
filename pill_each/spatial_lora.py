@@ -69,7 +69,7 @@ class SpatialCausalSelfAttention(llama.SpatialCausalSelfAttention):
         self.c_attn = SpatialMergedLinear(
             in_features=config.n_embd,
             out_features=3 * config.n_embd,
-            pill_dim=2,
+            pill_dim=config.s_embd,
             r=self.lora_config.r,
             lora_alpha=self.lora_config.alpha,
             lora_dropout=self.lora_config.dropout,
