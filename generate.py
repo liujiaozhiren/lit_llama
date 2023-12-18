@@ -118,6 +118,11 @@ def main(
     assert checkpoint_path.is_file(), checkpoint_path
     assert tokenizer_path.is_file(), tokenizer_path
 
+    prompt = "Given the sequence of POIs that a user accesses, predict the next most likely POI name. " \
+             "Use the first two POIs as input. Make sure the output is a POl name and not any other form. " \
+             "Avoid nonsense and irrelevant information. The sequence is as follows: " \
+             "\"Subway , Music Venue , Train Station , Subway , Subway , Train Station , Office , TrainStation , Laundry Service , Train Station , Airport , Train Station , Subway , Subway ,Train Station , Train Station , Train Station , Train Station , Department Store , StadiumSouthern / Soul Food Restaurant , Food & Drink Shop , Office , Subway , Train Station.Train Station , Subway , Train Station , Office , Train Station , Train Station , Train StationSubway , Subway , Train Station , Train Station , Train Station , Mexican RestaurantTrain Station , Office , Train Station , Subway , Train Station , Office , Movie Theater ,Post Office , Train Station , Subway , Train Station , Gas Station / Garage , Event SpaceTaco Place , Airport , Airport\"."\
+             " The next most likely POI is: \""
     precision = "bf16-true" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "32-true"
     fabric = L.Fabric(devices=1, precision=precision)
 

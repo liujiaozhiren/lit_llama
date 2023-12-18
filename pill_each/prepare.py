@@ -3,49 +3,71 @@ from torch import nn
 import math
 
 
-def gen_sentence(instruction, poi_token, poi_list, max_poi_len, tokenizer, device, max_token_len):
+instructions = [
+    # instruction 0 :
+    {"instruct_head":
+        "Given the sequence of POIs that a user accesses, predict the next most likely POI name. "
+        "Make sure the output is a POI name and not any other form. "
+        "Avoid nonsense and irrelevant information. The sequence is as follows: \"",
+     "instruct_tail": "\". ",
+     "answer_head": "The next most likely POI name is: \"",
+     "answer_tail": "\"."}
+]
+
+
+def gen_sentence(instruction, poi_token, poi_list, max_poi_len, tokenizer, max_token_len, device):
     places_id = poi_token
-    encoded_prompt = tokenizer.encode(instruction, bos=True, eos=False, device=device)
+    instruct_head = tokenizer.encode(instruction["instruct_head"], bos=True, eos=False, device=device)
+    instruct_tail = tokenizer.encode(instruction["instruct_tail"], bos=False, eos=False, device=device)
+    answer_head = tokenizer.encode(instruction["answer_head"], bos=False, eos=False, device=device)
+    answer_tail = tokenizer.encode(instruction["answer_tail"], bos=False, eos=True, device=device)
     encoded_split = tokenizer.encode(',', bos=False, eos=False)
-    encoded_gap = tokenizer.encode(" ", bos=False, eos=False)  # jn: abandon gap ^^
-    lang_input = encoded_prompt
-    patched_pos_input = torch.zeros((len(lang_input), 2), device=device, dtype=torch.float32)
+    lang_input = instruct_head
+    redundant_length = len(instruct_tail) + len(answer_head) + len(answer_tail)  # for total length calculation
+    poi_mask = torch.zeros(len(lang_input), device=device, dtype=torch.bool)  # True for POIs names, False for the others
     raw_pos_input = []
     spatial_scopes = []
-    # pos_idx = [len(lang_input)]
-    # print(f"start at {pos_start_idx}, patch_len = {max_poi_len}+{len(encoded_split)}")
-    num_poi = 0
-    for place_id in places_id:
-        num_poi += 1
+    poi_num = 0
+    encoded_place = None
+    lon, lat = 0.0, 0.0
+    for i in range(len(places_id)-1):
+        place_id = places_id[i]
         place = poi_list[place_id][1]
         lon, lat = poi_list[place_id][4], poi_list[place_id][3]  # We use [lon,lat] while the dataset used lat,lon
 
         encoded_place = tokenizer.encode(place, bos=False, eos=False)
-
-        # # jn: abandon gap ^^
-        # gap_len = max_poi_len - encoded_place.size(0)
-        # for _ in range(gap_len):
-        #     encoded_place = torch.cat([encoded_place, encoded_gap])
-
-        encoded_place = torch.cat([encoded_place, encoded_split])
-
-        # # jn: abandon gap ^^
-        # assert len(encoded_place) == len(encoded_split) + max_poi_len
-
-        spatial_scopes.append([len(lang_input), len(lang_input)+len(encoded_place)])  # *1*
-        raw_pos_input.append([lon, lat])
-
-        lang_input = torch.cat([lang_input, encoded_place])  # after *1*
-        pos_tensor = torch.tensor([[lon, lat]], device=device, dtype=torch.float32)
-        patched_pos_input = torch.cat([patched_pos_input, pos_tensor.repeat(len(encoded_place), 1)])
-        if max_token_len < len(lang_input) + len(encoded_split) + max_poi_len:
+        if max_token_len < len(lang_input) + len(encoded_place) + redundant_length + max_poi_len:
+            # if too long then stop here
             break
-        # if idx < len(places_id) - 1:
-        #     pos_idx.append(len(lang_input))
+
+        if poi_num > 1:  # add a split in front (to avoid redundant split at the end)
+            lang_input = torch.cat([lang_input, encoded_split])
+            poi_mask = torch.cat([poi_mask, torch.zeros(len(encoded_split), device=device, dtype=torch.bool)])
+
+        spatial_scopes.append([len(lang_input), len(lang_input) + len(encoded_place)])  # now there is no ','
+        raw_pos_input.append([lon, lat])
+        lang_input = torch.cat([lang_input, encoded_place])
+        poi_mask = torch.cat([poi_mask, torch.ones(len(encoded_place), device=device, dtype=torch.bool)])
+        poi_num += 1
+
+    lang_input = torch.cat([lang_input, instruct_tail])  # end Question
+    poi_mask = torch.cat([poi_mask, torch.zeros(len(instruct_tail), device=device, dtype=torch.bool)])
+    lang_input = torch.cat([lang_input, answer_head])  # start Answer
+    poi_mask = torch.cat([poi_mask, torch.zeros(len(answer_head), device=device, dtype=torch.bool)])
+    # add next POI answer
+    spatial_scopes.append([len(lang_input), len(lang_input) + len(encoded_place)])
+    raw_pos_input.append([lon, lat])
+    lang_input = torch.cat([lang_input, encoded_place])
+    poi_mask = torch.cat([poi_mask, torch.ones(len(encoded_place), device=device, dtype=torch.bool)])
+    poi_num += 1
+
+    lang_input = torch.cat([lang_input, answer_tail])  # end Answer
+    poi_mask = torch.cat([poi_mask, torch.zeros(len(answer_tail), device=device, dtype=torch.bool)])
+
     spatial_scopes = torch.tensor(spatial_scopes, device=device, dtype=torch.float32)
     raw_pos_input = torch.tensor(raw_pos_input, device=device, dtype=torch.float32)
 
-    return lang_input, patched_pos_input, raw_pos_input, spatial_scopes, num_poi
+    return lang_input, poi_mask, raw_pos_input, spatial_scopes, poi_num
 
 
 def get_bbox(poi_list):
@@ -62,41 +84,50 @@ def get_bbox(poi_list):
     return bbox
 
 
-def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None):
+def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None, max_seq_length=256, stage="train"):
     assert padded_vocab_size is not None
     # datas = [[(poi_id, cat, token_len, lon, lat, timestamp),...]]
     # poi_list = [(poi_id, cat, token_len, lon, lat),...]
     max_poi_len = 0
-    instruction = "Given a user's visited places sequence as follows, " \
-                  "predict which place the user will visit next: "
+    instruction = instructions[0]
     bbox = get_bbox(poi_list)  # boundary box
     for item in poi_list:
         max_poi_len = max(max_poi_len, item[2])
     data_ret = []
-    encoded_split = tokenizer.encode(',', bos=False, eos=False)
-    encoded_prompt = tokenizer.encode(instruction, bos=True, eos=False, device="cpu")
-    patch_len = max_poi_len + len(encoded_split)
-    pos_start_idx = len(encoded_prompt)
+    # encoded_split = tokenizer.encode(',', bos=False, eos=False)
+    # encoded_prompt = tokenizer.encode(instruction, bos=True, eos=False, device="cpu")
+    # patch_len = max_poi_len + len(encoded_split)
+    # pos_start_idx = len(encoded_prompt)
     for i, data in enumerate(datas):
-        sentence = data["sentence"]  # language
+        # sentence = data["sentence"]  # language
         # print("correct answer: \n{}".format(sentence))
         # spatial_addition = data["spatial_addition"]
         poi_seq = data["poi_token"]  # poi_id_list
-
-        prompt_sentence, spatial_addition, raw_spatial_addition, \
+        prompt_sentence, poi_mask, raw_spatial_addition, \
             spatial_scopes, num_poi = gen_sentence(instruction, poi_seq, poi_list,
-                                                   max_poi_len, tokenizer, 'cpu', 256)
-        spatial_addition = norm_spatial_seq(spatial_addition, bbox)
-        raw_spatial_addition = norm_spatial_seq(raw_spatial_addition, bbox)
+                                                   max_poi_len, tokenizer, max_seq_length, 'cpu')
+        if stage == "train" or stage == "valid":
+            language_input = prompt_sentence[:-1]
+            language_label = prompt_sentence[1:]
+            poi_mask = poi_mask[:-1]
+        else:  # if it's generation process, then get rid of the answer POI
+            quotation = tokenizer.encode("\"", bos=False, eos=False)
+            last_index = torch.where(prompt_sentence == quotation)[0][-1]
+            language_input = prompt_sentence[:last_index+1]
+            language_label = prompt_sentence
+            poi_mask = poi_mask[:last_index+1]
+            raw_spatial_addition = raw_spatial_addition[:-1]
+            spatial_scopes = spatial_scopes[:-1]
+            num_poi -= 1
 
+        raw_spatial_addition = norm_spatial_seq(raw_spatial_addition, bbox)
         legal_poi_seq = poi_seq[:num_poi]
         sample = {}
-        sample['language_inputs'] = prompt_sentence[:-1]
-        sample['language_labels'] = prompt_sentence[1:]
+        sample['language_inputs'] = language_input
+        sample['language_labels'] = language_label
         # sample['language_labels_onehot'] = torch.nn.functional.one_hot(sample['language_labels'],
         #                                                                num_classes=padded_vocab_size).to(torch.float32)
-        sample['spatial_inputs'] = spatial_addition[:-1]
-        sample['spatial_labels'] = spatial_addition[1:]
+        sample['poi_mask'] = poi_mask
         sample['raw_spatial'] = raw_spatial_addition
         sample['raw_spatial_labels'] = raw_spatial_addition[1:]
         sample['spatial_masks'] = torch.all(raw_spatial_addition[1:] == torch.tensor([0.0, 0.0]), dim=1)
@@ -105,8 +136,8 @@ def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None):
         # trainable_mask[:sample_len] = True
         sample['trainable_masks'] = trainable_mask
         sample['infer_poi'] = [poi_list[i] for i in legal_poi_seq]
-        spatial_scopes[-1][1] -= 1  # jn: do this because spatial_inputs remove the last node
         sample['spatial_scopes'] = spatial_scopes  # jn: include starts and ends (in case we need multiple length)
+
         # sample['spatial_start_idx'] = get_spatial_idx()  # jn:abandon this, see "spatial_scopes"
         # sample['pos_start_idx'] = pos_start_idx
         # sample['patch_len'] = patch_len
@@ -114,7 +145,7 @@ def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None):
         data_ret.append(sample)
         # optionally crop the logits to only the top k options
 
-    return data_ret, (pos_start_idx, patch_len, bbox)
+    return data_ret, (max_poi_len, bbox)
 
 
 def norm_spatial_seq(spatial_seq: torch.Tensor, bbox):

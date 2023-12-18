@@ -31,18 +31,20 @@ from tokenizer import Tokenizer
 from prepare_alpaca import generate_prompt
 
 instruction_tuning = True
-eval_interval = 100
-save_interval = 100
-eval_iters = 10
-log_interval = 1
 
 # Hyperparameters
 learning_rate = 3e-3  # 3e-4
 batch_size = 128
-micro_batch_size = 6
+micro_batch_size = 8
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
-max_iters = 20000 * 3 // micro_batch_size
+
+eval_interval = 50  # * gradient_accumulation_iters
+save_interval = 50  # * gradient_accumulation_iters
+eval_iters = 10
+log_interval = 1
+
+max_iters = 2500 * 8 // micro_batch_size
 weight_decay = 0.0
 max_seq_length = 256  # see scripts/prepare_alpaca.py
 lora_r = 8
@@ -50,14 +52,14 @@ lora_alpha = 16
 lora_dropout = 0.05
 warmup_iters = 100
 how_many_devices = 1
-which_devices = [2]
+which_devices = [5]
 
 
 def main(
         # data_dir: str = "../data/alpaca",
         pretrained_path: str = "../checkpoints/lit-llama/7B/lit-llama.pth",
         tokenizer_path: str = "../checkpoints/lit-llama/tokenizer.model",
-        out_dir: str = "../out/lora/alpaca",
+        out_dir: str = "../out/pill/poi/",
         trainset_dir: str = "../data/spatial_dataset/poi_train.pt",
         validset_dir: str = "../data/spatial_dataset/poi_test.pt",
         poi_dir: str = "../data/spatial_dataset/poi_list.pt",
@@ -67,7 +69,7 @@ def main(
         # dtype: torch.float32 = torch.float32,
         # quantize: Optional[str] = None,
 ):
-    lora_path = Path("../out/lora/alpaca/iter-006299-ckpt.pth")
+    lora_path = Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)
@@ -86,24 +88,34 @@ def main(
     # lora_checkpoint = lazy_load(lora_path)
     llama_config = LLaMASpatialConfig.from_name("7B")
     tokenizer = Tokenizer(Path(tokenizer_path))
-    data, tmp = prepare(data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
+    data, tmp = prepare(data, poi_list, tokenizer,
+                        padded_vocab_size=llama_config.padded_vocab_size, max_seq_length=max_seq_length)
     #valid_data, _ = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
     train_data, valid_data = data[:int(len(data)*0.8)], data[int(len(data)*0.8):]
-    llama_config.start_poi_idx, llama_config.patch_len, llama_config.bbox = tmp
-    with lazy_load(checkpoint_path) as pretrained_checkpoint, lazy_load(lora_path) as lora_checkpoint:
-        with fabric.init_module(), lora_pill(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True):
-            model = LLaMA_spatial(llama_config)
-            # strict=False because missing keys due to LoRA weights not contained in checkpoint state
-            model.load_state_dict(pretrained_checkpoint, strict=False)
-            model.load_state_dict(lora_checkpoint, strict=False)
+    llama_config.max_poi_len, llama_config.bbox = tmp
+
+    with fabric.init_module(), lora_pill(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True):
+        model = LLaMA_spatial(llama_config)
+        # strict=False because missing keys due to LoRA weights not contained in checkpoint state
+        if checkpoint_path is not None:
+            with lazy_load(checkpoint_path) as pretrained_checkpoint:
+                model.load_state_dict(pretrained_checkpoint, strict=False)
+                print("Load from checkpoint:{}.".format(checkpoint_path))
+        if lora_path is not None:
+            with lazy_load(lora_path) as lora_checkpoint:
+                model.load_state_dict(lora_checkpoint, strict=False)
+                print("Load from lora:{}.".format(lora_path))
+
     mark_only_lora_and_spatial_as_trainable(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     model, optimizer = fabric.setup(model, optimizer)
     train(fabric, model, optimizer, train_data, valid_data, tokenizer, out_dir, poi_finder)
 
     # Save the final LoRA checkpoint at the end of training
+    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)
     checkpoint = lora_spatial_state_dict(model)
-    fabric.save(os.path.join(out_dir, "lit-llama-lora-finetuned.pth"), checkpoint)
+    fabric.save(os.path.join(out_dir, "lora-spatial-pill-finetuned.pth"), checkpoint)
+    print("Saving final LoRA weights to {}".format(os.path.join(out_dir, "lora-spatial-pill-finetuned.pth")))
 
 
 def train(
@@ -129,13 +141,14 @@ def train(
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
             t0 = time.time()
-            lang_input, lang_label, trainable_mask,\
-                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = get_batch(fabric, train_data)
+            lang_input, lang_label, poi_mask, trainable_mask,\
+                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = get_batch(fabric, train_data,
+                                                                                        batch_size=micro_batch_size)
 
-            val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
+            # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
 
             with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
-                logits, coord = model(lang_input, raw_spatial, spatial_scope, 256)
+                logits, coord = model(lang_input, poi_mask, raw_spatial, spatial_scope, max_seq_length)
                 loss_lang, loss_spa = merged_loss_fn(logits, coord, lang_label, raw_spatial_label,
                                                      spatial_mask, trainable_mask)
                 loss = loss_lang + 10 * loss_spa
@@ -143,23 +156,24 @@ def train(
                 optimizer.step()
                 optimizer.zero_grad()
                 # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)
+
             if (iter_num + 1) % gradient_accumulation_iters == 0:
                 optimizer.step()
                 optimizer.zero_grad()
 
                 step_count += 1
-
                 if step_count % eval_interval == 0:
                     val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)
                     fabric.print(f"step {iter_num}: val hr10 {hr10}, hr50 {hr50}")
                     fabric.barrier()
 
                 if step_count % save_interval == 0:
-                    print(f"Saving LoRA weights to {out_dir}")
+                    out_path = os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth")
+                    print(f"Saving LoRA weights to {out_path}")
                     # We are only saving the LoRA weights
                     # TODO: Provide a function/script to merge the LoRA weights with pretrained weights
                     checkpoint = lora_spatial_state_dict(model)
-                    fabric.save(os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"), checkpoint)
+                    fabric.save(out_path, checkpoint)
 
             dt = time.time() - t0
             if iter_num % log_interval == 0:
@@ -196,11 +210,11 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: List, tokenizer
     with tqdm(range(eval_iters), "in validating...", mininterval=2, ncols=130) as tq:
         for k in tq:
             iter = range(k * infer_batch_size, min((k + 1) * infer_batch_size, len(val_data)))
-            lang_input, lang_label, trainable_mask, valid_data, \
+            lang_input, lang_label, poi_mask, trainable_mask, valid_data, \
                 raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = \
-                get_batch(fabric, val_data, train=False, iter=iter)
-            logits, coord = model(lang_input, raw_spatial, spatial_scope, 256)
-            hit_cate, hr10, hr50, total = valid_accuracy(valid_data, logits, coord, spatial_scope, tokenizer, poi_finder)
+                get_batch(fabric, val_data, train=False, iter=iter, batch_size=micro_batch_size)
+            logits, coord = model(lang_input, poi_mask, raw_spatial, spatial_scope, max_seq_length)
+            hit_cate, hr10, hr50, total = valid_accuracy(valid_data, lang_label, logits, coord, spatial_scope, tokenizer, poi_finder)
             total_base += total
             hit += hit_cate
             hr_10 += hr10
@@ -225,9 +239,9 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: List, tokenizer
     return out, hr_10 / total_base, hr_50 / total_base
 
 
-def valid_accuracy(val_data, logits, coords, spatial_scopes,
+def valid_accuracy(val_data, lang_labels, logits, coords, spatial_scopes,
                    tokenizer: Tokenizer, poi_finder: POI_Find_Dict,
-                   valid_last=5, top_k=10):
+                   valid_last=1, top_k=10):
     infer_pois = val_data['infer_poi']
     poi_nums = val_data['poi_num']
     total = 0
@@ -239,6 +253,7 @@ def valid_accuracy(val_data, logits, coords, spatial_scopes,
         coord = coords[i]
         poi_list = infer_pois[i]
         poi_num = poi_nums[i]
+        lang_label = lang_labels[i]
         spatial_scope = spatial_scopes[i]
         assert poi_num == (spatial_scope != 0).sum(dim=0)[0]
         # note: "poi_num != len(spatial_scope)" because spatial_scope is padded
@@ -246,7 +261,10 @@ def valid_accuracy(val_data, logits, coords, spatial_scopes,
         # optionally crop the logits to only the top k options
         if top_k is not None:
             v, _ = torch.topk(logit, min(top_k, logit.size(-1)))
-            logit = torch.where(logit < v[:, -1].unsqueeze(1), -float("Inf"), logit)
+            a = logit < v[:, -1].unsqueeze(1)
+            b = logit >= v[:, 0].unsqueeze(1)
+            # logit = torch.where(torch.bitwise_or(a, b), -float("Inf"), logit)
+            logit = torch.where(a, -float("Inf"), logit)
 
         probs = torch.nn.functional.softmax(logit, dim=-1)
         idx_next = torch.multinomial(probs, num_samples=1).to(dtype=torch.int64)
@@ -254,7 +272,7 @@ def valid_accuracy(val_data, logits, coords, spatial_scopes,
 
         for id in range(begin_num, poi_num):
             start, end = spatial_scope[id]
-            infer_cat_name = tokenizer.decode(idx_next[start:end].view(-1))
+            infer_cat_name = tokenizer.decode(idx_next[start-1:end-1].view(-1))
             poi = poi_list[id]
             lon, lat = coord[id]
             pos = poi_finder.find_cat_pos(infer_cat_name, lon, lat, poi[0])
@@ -294,16 +312,15 @@ def language_loss_fn(logits, targets, mask):
     return loss
 
 
-def get_batch(fabric: L.Fabric, data: list, train=True, iter=None):
+def get_batch(fabric: L.Fabric, data: list, train=True, iter=None, batch_size=8):
     # data = [(poi_id, cat, token_len, lon, lat, timestamp),...]
-    ix = torch.randint(len(data), (micro_batch_size,))
+    ix = torch.randint(len(data), (batch_size,))
     # ix = torch.tensor([0, 1, 2, 3])
     if not train:
         ix = iter
     language_input = [data[i]["language_inputs"].type(torch.int64) for i in ix]
     language_label = [data[i]["language_labels"].type(torch.int64) for i in ix]
-    spatial_input = [data[i]["spatial_inputs"].type(torch.float32) for i in ix]
-    spatial_label = [data[i]["spatial_labels"].type(torch.float32) for i in ix]
+    poi_mask = [data[i]["poi_mask"].type(torch.bool) for i in ix]
     spatial_mask = [data[i]["spatial_masks"].type(torch.bool) for i in ix]
     trainable_mask = [data[i]["trainable_masks"].type(torch.bool) for i in ix]
     raw_spatial = [data[i]["raw_spatial"].type(torch.float32) for i in ix]
@@ -329,9 +346,7 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None):
     li = torch.stack([pad_right(x, pad_value=0) for x in language_input])
     ll = torch.stack([pad_right(x, pad_value=-1) for x in language_label])
     # y = torch.stack([pad_right(x, pad_id=-1) for x in labels])
-    si = torch.stack([pad_right(x, pad_value=torch.zeros(2, dtype=x.dtype, device=x.device)) for x in spatial_input])
-    sl = torch.stack(
-        [pad_right(x, pad_value=torch.zeros(2, dtype=x.dtype, device=x.device)) for x in spatial_label])
+    pm = torch.stack([pad_right(x, pad_value=False) for x in poi_mask])
     tm = torch.stack([pad_right(x, pad_value=True) for x in trainable_mask])
 
     rs = torch.stack(
@@ -345,20 +360,18 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None):
          for x in spatial_scope])
     sm = torch.stack([pad_right(x, pad_value=True, max_len=max_poi_seq_length) for x in spatial_mask])
 
-    language_input, language_label, \
-    spatial_input, spatial_label, spatial_scope, \
-    trainable_mask, raw_spatial, raw_spatial_label, spatial_mask = \
-        fabric.to_device((li.pin_memory(), ll.pin_memory(),
-                          si.pin_memory(), sl.pin_memory(), ss.pin_memory(),
-                          tm.pin_memory(), rs.pin_memory(), rl.pin_memory(), sm.pin_memory()))
+    language_input, language_label, poi_mask, trainable_mask, \
+    raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = \
+        fabric.to_device((li.pin_memory(), ll.pin_memory(), pm.pin_memory(), tm.pin_memory(),
+                          rs.pin_memory(), rl.pin_memory(), ss.pin_memory(), sm.pin_memory()))
 
     if train:
-        return language_input, language_label, trainable_mask, \
+        return language_input, language_label, poi_mask, trainable_mask, \
                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask
     valid_data = {}
     valid_data['infer_poi'] = infer_poi
     valid_data['poi_num'] = poi_num
-    return language_input, language_label, trainable_mask, valid_data, \
+    return language_input, language_label, poi_mask, trainable_mask, valid_data, \
            raw_spatial, raw_spatial_label, spatial_scope, spatial_mask
 
 
