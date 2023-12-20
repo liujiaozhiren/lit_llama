@@ -36,11 +36,12 @@ def gen_sentence(instruction, poi_token, poi_list, max_poi_len, tokenizer, max_t
         lon, lat = poi_list[place_id][4], poi_list[place_id][3]  # We use [lon,lat] while the dataset used lat,lon
 
         encoded_place = tokenizer.encode(place, bos=False, eos=False)
-        if max_token_len < len(lang_input) + len(encoded_place) + redundant_length + max_poi_len:
+        if max_token_len < len(lang_input) + len(encoded_place) + redundant_length + max_poi_len \
+                or i >= len(places_id)-2:
             # if too long then stop here
             break
 
-        if poi_num > 1:  # add a split in front (to avoid redundant split at the end)
+        if poi_num >= 1:  # add a split in front (to avoid redundant split at the end)
             lang_input = torch.cat([lang_input, encoded_split])
             poi_mask = torch.cat([poi_mask, torch.zeros(len(encoded_split), device=device, dtype=torch.bool)])
 
@@ -84,7 +85,7 @@ def get_bbox(poi_list):
     return bbox
 
 
-def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None, max_seq_length=256, stage="train"):
+def prepare(datas: list, poi_list: list, tokenizer, wl, padded_vocab_size=None, max_seq_length=256, stage="train"):
     assert padded_vocab_size is not None
     # datas = [[(poi_id, cat, token_len, lon, lat, timestamp),...]]
     # poi_list = [(poi_id, cat, token_len, lon, lat),...]
@@ -137,7 +138,8 @@ def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None, max_
         sample['trainable_masks'] = trainable_mask
         sample['infer_poi'] = [poi_list[i] for i in legal_poi_seq]
         sample['spatial_scopes'] = spatial_scopes  # jn: include starts and ends (in case we need multiple length)
-
+        last_poi_cat_name = poi_list[legal_poi_seq[-1]][1]
+        sample['last_poi_lang_label'] = wl.label(last_poi_cat_name)
         # sample['spatial_start_idx'] = get_spatial_idx()  # jn:abandon this, see "spatial_scopes"
         # sample['pos_start_idx'] = pos_start_idx
         # sample['patch_len'] = patch_len

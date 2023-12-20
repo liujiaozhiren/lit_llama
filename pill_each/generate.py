@@ -29,7 +29,7 @@ lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 max_seq_length = 256
-which_devices = [1]
+which_devices = [2]
 
 @torch.no_grad()
 def not_spatial_generate(
@@ -115,7 +115,7 @@ def generate(
         max_new_tokens: int,
         *,
         max_seq_length: Optional[int] = None,
-        temperature: float = 1.0,
+        temperature: float = 1.05,
         top_k: Optional[int] = None,
         eos_id: Optional[int] = None,
 ) -> (torch.Tensor, torch.Tensor):
@@ -204,10 +204,11 @@ def generate_main(
         trainset_dir: str = "../data/spatial_dataset/poi_train.pt",
         validset_dir: str = "../data/spatial_dataset/poi_test.pt",
         poi_dir: str = "../data/spatial_dataset/poi_list.pt",
+        lora_path: Path = Path("../out/lora/alpaca/lit-llama-lora-finetuned.pth"),
         checkpoint_path: Path = Path("../checkpoints/lit-llama/7B/lit-llama.pth"),
-        spatial=False
+        spatial=True
 ):
-    lora_path = Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")
+    lora_path = Path("../out/pill/poi/iter-001599-ckpt.pth")
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     # fabric.seed_everything(1337 + fabric.global_rank)

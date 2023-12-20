@@ -7,7 +7,8 @@ from typing import Dict, List, Tuple
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from lit_llama.lora import MergedLinear
+# from lit_llama.lora import MergedLinear
+from lora_with_w import MergedLinear
 import model_spatial as llama
 
 
