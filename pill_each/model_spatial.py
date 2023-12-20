@@ -331,11 +331,11 @@ class SpatialCausalSelfAttention(nn.Module):
 
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.spatial_linear = nn.Linear(config.s_embd, config.s_embd * 3)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.spatial_pill_proj = nn.Linear(config.s_embd * config.n_head,
                                            config.s_embd, bias=False)
-
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.s_embd = config.s_embd
@@ -356,7 +356,8 @@ class SpatialCausalSelfAttention(nn.Module):
         C = self.n_embd
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        origin, pill = self.c_attn(x, s)
+        origin = self.c_attn(x)
+        pill = self.spatial_linear(s)
         q_orig, k_orig, v_orig = origin.split(self.n_embd, dim=2)
         q_pill, k_pill, v_pill = pill.split(self.s_embd, dim=2)
 

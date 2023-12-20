@@ -208,7 +208,7 @@ def generate_main(
         checkpoint_path: Path = Path("../checkpoints/lit-llama/7B/lit-llama.pth"),
         spatial=True
 ):
-    lora_path = Path("../out/pill/poi/iter-001599-ckpt.pth")
+    lora_path = None
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     # fabric.seed_everything(1337 + fabric.global_rank)
@@ -224,7 +224,6 @@ def generate_main(
     llama_config = LLaMASpatialConfig.from_name("7B")
     tokenizer = Tokenizer(Path(tokenizer_path))
     data, tmp = prepare(data, poi_list, tokenizer,
-                        padded_vocab_size=llama_config.padded_vocab_size,
                         max_seq_length=max_seq_length,
                         stage="generate")
     #valid_data, _ = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)

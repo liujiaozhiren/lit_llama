@@ -69,7 +69,7 @@ def main(
         # dtype: torch.float32 = torch.float32,
         # quantize: Optional[str] = None,
 ):
-    lora_path = Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")
+    lora_path = [None, Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")][0]
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)
@@ -111,7 +111,7 @@ def main(
     train(fabric, model, optimizer, train_data, valid_data, tokenizer, out_dir, poi_finder)
 
     # Save the final LoRA checkpoint at the end of training
-    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)
+    validate(fabric, model, valid_data, tokenizer, poi_finder)
     checkpoint = lora_spatial_state_dict(model)
     fabric.save(os.path.join(out_dir, "lora-spatial-pill-finetuned.pth"), checkpoint)
     print("Saving final LoRA weights to {}".format(os.path.join(out_dir, "lora-spatial-pill-finetuned.pth")))
@@ -132,6 +132,7 @@ def train(
     Loosely based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
     """
     step_count = 0
+    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
     with tqdm(range(max_iters), f"Initial Training...", mininterval=2, ncols=130) as tq:
         for iter_num in tq:
             if step_count <= warmup_iters:
@@ -143,8 +144,6 @@ def train(
             lang_input, lang_label, poi_mask, trainable_mask,\
                 raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = get_batch(fabric, train_data,
                                                                                         batch_size=micro_batch_size)
-
-            # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
 
             with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
                 logits, coord = model(lang_input, poi_mask, raw_spatial, spatial_scope, max_seq_length)

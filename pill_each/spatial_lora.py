@@ -67,10 +67,9 @@ class SpatialCausalSelfAttention(llama.SpatialCausalSelfAttention):
         #     fan_in_fan_out = False,
         #     merge_weights=True,
         #     bias=False)
-        self.c_attn = SpatialMergedLinear(
+        self.c_attn = MergedLinear(
             in_features=config.n_embd,
             out_features=3 * config.n_embd,
-            pill_dim=config.s_embd,
             r=self.lora_config.r,
             lora_alpha=self.lora_config.alpha,
             lora_dropout=self.lora_config.dropout,
@@ -78,6 +77,8 @@ class SpatialCausalSelfAttention(llama.SpatialCausalSelfAttention):
             fan_in_fan_out=False,
             merge_weights=True,
             bias=False)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.spatial_linear = nn.Linear(config.s_embd, config.s_embd * 3)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.spatial_pill_proj = nn.Linear(config.s_embd * config.n_head,
@@ -105,6 +106,7 @@ class SpatialMergedLinear(nn.Module):
             fan_in_fan_out=fan_in_fan_out,
             merge_weights=merge_weights,
             bias=bias)
+        self.n_linear = nn.Linear(in_features, out_features, bias=False)  # Im Mr Meeseeks!
         self.spatial_linear = nn.Linear(pill_dim, pill_dim * 3)
 
     def forward(self, x: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
