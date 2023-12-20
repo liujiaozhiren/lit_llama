@@ -85,8 +85,7 @@ def get_bbox(poi_list):
     return bbox
 
 
-def prepare(datas: list, poi_list: list, tokenizer, padded_vocab_size=None, max_seq_length=256, stage="train"):
-    assert padded_vocab_size is not None
+def prepare(datas: list, poi_list: list, tokenizer, max_seq_length=256, stage="train"):
     # datas = [[(poi_id, cat, token_len, lon, lat, timestamp),...]]
     # poi_list = [(poi_id, cat, token_len, lon, lat),...]
     max_poi_len = 0

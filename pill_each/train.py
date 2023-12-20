@@ -88,8 +88,7 @@ def main(
     # lora_checkpoint = lazy_load(lora_path)
     llama_config = LLaMASpatialConfig.from_name("7B")
     tokenizer = Tokenizer(Path(tokenizer_path))
-    data, tmp = prepare(data, poi_list, tokenizer,
-                        padded_vocab_size=llama_config.padded_vocab_size, max_seq_length=max_seq_length)
+    data, tmp = prepare(data, poi_list, tokenizer, max_seq_length=max_seq_length)
     #valid_data, _ = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
     train_data, valid_data = data[:int(len(data)*0.8)], data[int(len(data)*0.8):]
     llama_config.max_poi_len, llama_config.bbox = tmp
