@@ -29,7 +29,7 @@ lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 max_seq_length = 256
-which_devices = [2]
+which_devices = [0]
 
 @torch.no_grad()
 def not_spatial_generate(
