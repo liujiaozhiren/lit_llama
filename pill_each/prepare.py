@@ -64,7 +64,7 @@ def gen_sentence(instruction, poi_token, poi_list, max_poi_len, tokenizer, max_t
     lang_input = torch.cat([lang_input, answer_tail])  # end Answer
     poi_mask = torch.cat([poi_mask, torch.zeros(len(answer_tail), device=device, dtype=torch.bool)])
 
-    spatial_scopes = torch.tensor(spatial_scopes, device=device, dtype=torch.float32)
+    spatial_scopes = torch.tensor(spatial_scopes, device=device, dtype=torch.int)
     raw_pos_input = torch.tensor(raw_pos_input, device=device, dtype=torch.float32)
 
     return lang_input, poi_mask, raw_pos_input, spatial_scopes, poi_num
@@ -134,11 +134,13 @@ def prepare(datas: list, poi_list: list, tokenizer, wl, padded_vocab_size=None, 
 
         trainable_mask = torch.zeros(sample['language_inputs'].shape[0], dtype=torch.bool)
         # trainable_mask[:sample_len] = True
+        trainable_mask[:(spatial_scopes[-1][0]-1)]
         sample['trainable_masks'] = trainable_mask
         sample['infer_poi'] = [poi_list[i] for i in legal_poi_seq]
         sample['spatial_scopes'] = spatial_scopes  # jn: include starts and ends (in case we need multiple length)
         last_poi_cat_name = poi_list[legal_poi_seq[-1]][1]
         sample['last_poi_lang_label'] = wl.label(last_poi_cat_name)
+        sample['last_poi_start_idx'] = spatial_scopes[-1][0]
         # sample['spatial_start_idx'] = get_spatial_idx()  # jn:abandon this, see "spatial_scopes"
         # sample['pos_start_idx'] = pos_start_idx
         # sample['patch_len'] = patch_len

@@ -84,8 +84,8 @@ class SpatialBlock(nn.Module):
             input_pos: Optional[torch.Tensor] = None,
             kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCache]]:
-        x, s = self.rms_1(x, s)
-        hx, hs, new_kv_cache = self.attn(x, s, rope, mask, max_seq_length, input_pos, kv_cache)
+        x_rms, s_rms = self.rms_1(x, s)
+        hx, hs, new_kv_cache = self.attn(x_rms, s_rms, rope, mask, max_seq_length, input_pos, kv_cache)
         x = x + hx
         s = s + hs
         mx, ms = self.mlp(*self.rms_2(x, s))
