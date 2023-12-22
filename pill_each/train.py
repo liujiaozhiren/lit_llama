@@ -33,14 +33,14 @@ from prepare_alpaca import generate_prompt
 instruction_tuning = True
 
 # Hyperparameters
-learning_rate = 3e-3  # 3e-4
+learning_rate = 3e-4  # 3e-4
 batch_size = 128
 micro_batch_size = 8
 gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 
-eval_interval = 50  # * gradient_accumulation_iters
-save_interval = 50  # * gradient_accumulation_iters
+eval_interval = 25  # * gradient_accumulation_iters
+save_interval = 25  # * gradient_accumulation_iters
 eval_iters = 10
 log_interval = 1
 
@@ -52,7 +52,7 @@ lora_alpha = 16
 lora_dropout = 0.05
 warmup_iters = 100
 how_many_devices = 1
-which_devices = [5]
+which_devices = [7]
 
 
 def main(
@@ -132,7 +132,7 @@ def train(
     Loosely based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
     """
     step_count = 0
-    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
+    # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
     with tqdm(range(max_iters), f"Initial Training...", mininterval=2, ncols=130) as tq:
         for iter_num in tq:
             if step_count <= warmup_iters:

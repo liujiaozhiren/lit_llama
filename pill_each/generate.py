@@ -29,7 +29,9 @@ lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.05
 max_seq_length = 256
-which_devices = [0]
+which_devices = [5]
+spatial_mark = True
+
 
 @torch.no_grad()
 def not_spatial_generate(
@@ -206,9 +208,9 @@ def generate_main(
         poi_dir: str = "../data/spatial_dataset/poi_list.pt",
         lora_path: Path = Path("../out/lora/alpaca/lit-llama-lora-finetuned.pth"),
         checkpoint_path: Path = Path("../checkpoints/lit-llama/7B/lit-llama.pth"),
-        spatial=True
+        spatial=spatial_mark
 ):
-    lora_path = None
+    lora_path = Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     # fabric.seed_everything(1337 + fabric.global_rank)

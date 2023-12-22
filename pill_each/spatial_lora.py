@@ -7,8 +7,8 @@ from typing import Dict, List, Tuple
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-# from lit_llama.lora import MergedLinear
-from lora_with_w import MergedLinear
+from lit_llama.lora import MergedLinear
+# from lora_with_w import MergedLinear
 import model_spatial as llama
 
 
@@ -77,7 +77,7 @@ class SpatialCausalSelfAttention(llama.SpatialCausalSelfAttention):
             fan_in_fan_out=False,
             merge_weights=True,
             bias=False)
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.spatial_linear = nn.Linear(config.s_embd, config.s_embd * 3)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)

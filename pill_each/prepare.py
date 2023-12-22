@@ -65,7 +65,7 @@ def gen_sentence(instruction, poi_token, poi_list, max_poi_len, tokenizer, max_t
     lang_input = torch.cat([lang_input, answer_tail])  # end Answer
     poi_mask = torch.cat([poi_mask, torch.zeros(len(answer_tail), device=device, dtype=torch.bool)])
 
-    spatial_scopes = torch.tensor(spatial_scopes, device=device, dtype=torch.float32)
+    spatial_scopes = torch.tensor(spatial_scopes, device=device, dtype=torch.int64)
     raw_pos_input = torch.tensor(raw_pos_input, device=device, dtype=torch.float32)
 
     return lang_input, poi_mask, raw_pos_input, spatial_scopes, poi_num
@@ -133,6 +133,7 @@ def prepare(datas: list, poi_list: list, tokenizer, max_seq_length=256, stage="t
         sample['spatial_masks'] = torch.all(raw_spatial_addition[1:] == torch.tensor([0.0, 0.0]), dim=1)
 
         trainable_mask = torch.zeros(sample['language_inputs'].shape[0], dtype=torch.bool)
+        trainable_mask[:(spatial_scopes[-1][0]-1)] = True
         # trainable_mask[:sample_len] = True
         sample['trainable_masks'] = trainable_mask
         sample['infer_poi'] = [poi_list[i] for i in legal_poi_seq]
