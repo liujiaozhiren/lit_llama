@@ -85,7 +85,7 @@ def get_bbox(poi_list):
     return bbox
 
 
-def prepare(datas: list, poi_list: list, tokenizer, max_seq_length=256, stage="train"):
+def prepare(datas: list, poi_list: list, tokenizer,wl, max_seq_length=256, stage="train"):
     # datas = [[(poi_id, cat, token_len, lon, lat, timestamp),...]]
     # poi_list = [(poi_id, cat, token_len, lon, lat),...]
     max_poi_len = 0
@@ -138,6 +138,9 @@ def prepare(datas: list, poi_list: list, tokenizer, max_seq_length=256, stage="t
         sample['trainable_masks'] = trainable_mask
         sample['infer_poi'] = [poi_list[i] for i in legal_poi_seq]
         sample['spatial_scopes'] = spatial_scopes  # jn: include starts and ends (in case we need multiple length)
+        last_poi_cat_name = poi_list[legal_poi_seq[-1]][1]
+        sample['last_poi_lang_label'] = wl.label(last_poi_cat_name)
+        sample['last_poi_start_idx'] = spatial_scopes[-1][0]
         # sample['spatial_start_idx'] = get_spatial_idx()  # jn:abandon this, see "spatial_scopes"
         # sample['pos_start_idx'] = pos_start_idx
         # sample['patch_len'] = patch_len

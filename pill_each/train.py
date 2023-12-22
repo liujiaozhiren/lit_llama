@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+from pill_each.white_list import White_list
 
 from utils import lazy_load
 # from pill_each.model_spatial import LLaMA_spatial
@@ -52,7 +53,7 @@ lora_alpha = 16
 lora_dropout = 0.05
 warmup_iters = 100
 how_many_devices = 1
-which_devices = [7]
+which_devices = [0]
 
 
 def main(
@@ -88,7 +89,8 @@ def main(
     # lora_checkpoint = lazy_load(lora_path)
     llama_config = LLaMASpatialConfig.from_name("7B")
     tokenizer = Tokenizer(Path(tokenizer_path))
-    data, tmp = prepare(data, poi_list, tokenizer, max_seq_length=max_seq_length)
+    wl = White_list(poi_list, tokenizer, llama_config.vocab_size)
+    data, tmp = prepare(data, poi_list, tokenizer,wl, max_seq_length=max_seq_length)
     #valid_data, _ = prepare(valid_data, poi_list, tokenizer, padded_vocab_size=llama_config.padded_vocab_size)
     train_data, valid_data = data[:int(len(data)*0.8)], data[int(len(data)*0.8):]
     llama_config.max_poi_len, llama_config.bbox = tmp
@@ -131,6 +133,9 @@ def train(
 
     Loosely based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
     """
+    global eval_interval,save_interval
+    eval_interval = len(train_data) // batch_size
+    save_interval = eval_interval
     step_count = 0
     # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
     with tqdm(range(max_iters), f"Initial Training...", mininterval=2, ncols=130) as tq:
@@ -142,19 +147,18 @@ def train(
                     param_group['lr'] = lr
             t0 = time.time()
             lang_input, lang_label, poi_mask, trainable_mask,\
-                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = get_batch(fabric, train_data,
+                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask,white_list_label,last_poi_start_idx = get_batch(fabric, train_data,
                                                                                         batch_size=micro_batch_size)
 
             with fabric.no_backward_sync(model, enabled=((iter_num + 1) % gradient_accumulation_iters != 0)):
                 logits, coord = model(lang_input, poi_mask, raw_spatial, spatial_scope, max_seq_length)
-                loss_lang, loss_spa = merged_loss_fn(logits, coord, lang_label, raw_spatial_label,
-                                                     spatial_mask, trainable_mask)
+                loss_lang, loss_spa, loss_wl = merged_loss_fn(logits, coord, lang_label, raw_spatial_label,
+                                                     spatial_mask, trainable_mask, (white_list_label, last_poi_start_idx))
                 loss = loss_lang + 10 * loss_spa
                 fabric.backward(loss / gradient_accumulation_iters)
                 optimizer.step()
                 optimizer.zero_grad()
                 # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)
-
             if (iter_num + 1) % gradient_accumulation_iters == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -209,7 +213,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_data: List, tokenizer
         for k in tq:
             iter = range(k * infer_batch_size, min((k + 1) * infer_batch_size, len(val_data)))
             lang_input, lang_label, poi_mask, trainable_mask, valid_data, \
-                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = \
+                raw_spatial, raw_spatial_label, spatial_scope, spatial_mask,_ = \
                 get_batch(fabric, val_data, train=False, iter=iter, batch_size=micro_batch_size)
             logits, coord = model(lang_input, poi_mask, raw_spatial, spatial_scope, max_seq_length)
             hit_cate, hr10, hr50, total = valid_accuracy(valid_data, lang_label, logits, coord, spatial_scope, tokenizer, poi_finder)
@@ -284,14 +288,29 @@ def valid_accuracy(val_data, lang_labels, logits, coords, spatial_scopes,
     return hit_cate, hr10, hr50, total
 
 
-def merged_loss_fn(lang_output, spa_output, lang_label, spa_label, spa_mask, trainable_mask):
+def merged_loss_fn(lang_output, spa_output, lang_label, spa_label, spa_mask, trainable_mask, wl_cmb=None):
     # shift the targets such that output n predicts token n+1
     # jn: every output row's effective length has "len(spa_output) = len(spa_label) + 1" but it's fine.
     # spa_mask has already masked the last redundant output in spa_output
     loss_lang = language_loss_fn(lang_output, lang_label, trainable_mask)
     loss_spa = spatial_loss_fn(spa_output, spa_label, spa_mask)
+    if wl_cmb is not None:
+        white_list_label, last_poi_start_idx = wl_cmb
+        loss_wl = white_list_loss_fn(lang_output, white_list_label, last_poi_start_idx)
+        return loss_lang, loss_spa, loss_wl
     return loss_lang, loss_spa
 
+def white_list_loss_fn(lang_output, white_list_label, last_poi_start_idx):
+    loss = 0
+    for batch in range(len(lang_output)):
+        output = lang_output[batch]
+        target = white_list_label[batch]
+        start_pos = last_poi_start_idx[batch]-1
+        output = output[start_pos:start_pos+len(target)]
+        target=target[:output.shape[0]]
+        assert output.shape == target.shape
+        loss += torch.nn.functional.cross_entropy(output.view(-1),target.view(-1))
+    return loss
 
 def spatial_loss_fn(logits, target, spa_mask):
     mse_loss = F.mse_loss(logits[~spa_mask], target[~spa_mask], reduction='mean')
@@ -309,11 +328,26 @@ def language_loss_fn(logits, targets, mask):
                                              ignore_index=ignore_value)
     return loss
 
+current_data_idx = 0
+def batch_generator(max_num, batch_size):
+    global current_data_idx
+    current = current_data_idx
+    if current + batch_size > max_num:
+        end = current + batch_size - max_num
+        tmp = list(range(current, max_num))
+        tmp.extend(list(range(0, current + batch_size - max_num)))
+
+    else:
+        end = current + batch_size
+        tmp = list(range(current, end))
+    current_data_idx = end
+    return tmp
+
 
 def get_batch(fabric: L.Fabric, data: list, train=True, iter=None, batch_size=8):
     # data = [(poi_id, cat, token_len, lon, lat, timestamp),...]
-    ix = torch.randint(len(data), (batch_size,))
-    # ix = torch.tensor([0, 1, 2, 3])
+    # ix = torch.randint(len(data), (batch_size,))
+    ix = batch_generator(len(data), batch_size)
     if not train:
         ix = iter
     language_input = [data[i]["language_inputs"].type(torch.int64) for i in ix]
@@ -324,6 +358,8 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None, batch_size=8)
     raw_spatial = [data[i]["raw_spatial"].type(torch.float32) for i in ix]
     raw_spatial_label = [data[i]["raw_spatial_labels"].type(torch.float32) for i in ix]
     spatial_scope = [data[i]["spatial_scopes"].type(torch.int64) for i in ix]
+    white_list_label = [data[i]["last_poi_lang_label"].type(torch.float32) for i in ix]
+    last_poi_start_idx = [data[i]["last_poi_start_idx"].type(torch.int) for i in ix]
     # poi_idx = [data[i]["spatial_start_idx"].type(torch.int64) for i in ix]
 
     if not train:
@@ -362,15 +398,16 @@ def get_batch(fabric: L.Fabric, data: list, train=True, iter=None, batch_size=8)
     raw_spatial, raw_spatial_label, spatial_scope, spatial_mask = \
         fabric.to_device((li.pin_memory(), ll.pin_memory(), pm.pin_memory(), tm.pin_memory(),
                           rs.pin_memory(), rl.pin_memory(), ss.pin_memory(), sm.pin_memory()))
+    label_wl = [fabric.to_device(item.pin_memory()) for item in white_list_label]
 
     if train:
         return language_input, language_label, poi_mask, trainable_mask, \
-               raw_spatial, raw_spatial_label, spatial_scope, spatial_mask
+               raw_spatial, raw_spatial_label, spatial_scope, spatial_mask, label_wl, last_poi_start_idx
     valid_data = {}
     valid_data['infer_poi'] = infer_poi
     valid_data['poi_num'] = poi_num
     return language_input, language_label, poi_mask, trainable_mask, valid_data, \
-           raw_spatial, raw_spatial_label, spatial_scope, spatial_mask
+           raw_spatial, raw_spatial_label, spatial_scope, spatial_mask, label_wl
 
 
 if __name__ == "__main__":
