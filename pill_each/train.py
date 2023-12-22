@@ -132,7 +132,7 @@ def train(
     Loosely based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
     """
     step_count = 0
-    # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
+    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
     with tqdm(range(max_iters), f"Initial Training...", mininterval=2, ncols=130) as tq:
         for iter_num in tq:
             if step_count <= warmup_iters:

@@ -36,8 +36,8 @@ class LLaMASpatialConfig:
     n_embd: int = 4096
     s_embd: int = 4
     s_head: int = 1
-    n_pill_s: float = 0.0
-    s_pill_n: float = 0.0
+    n_pill_s: float = 1.0
+    s_pill_n: float = 1.0
     r: float = 0.0
     alpha: float = 1.0
     dropout: float = 0.0

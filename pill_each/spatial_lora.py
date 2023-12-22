@@ -77,7 +77,7 @@ class SpatialCausalSelfAttention(llama.SpatialCausalSelfAttention):
             fan_in_fan_out=False,
             merge_weights=True,
             bias=False)
-        # self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.spatial_linear = nn.Linear(config.s_embd, config.s_embd * 3)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
