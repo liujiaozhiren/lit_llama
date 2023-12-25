@@ -70,7 +70,7 @@ def main(
         # dtype: torch.float32 = torch.float32,
         # quantize: Optional[str] = None,
 ):
-    lora_path = [None, Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")][0]
+    lora_path = [None, Path("../out/pill/backup/lora-without-spatial.pth")][1]
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)
@@ -137,7 +137,7 @@ def train(
     eval_interval = len(train_data) // batch_size
     save_interval = eval_interval
     step_count = 0
-    # val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
+    val_loss, hr10, hr50 = validate(fabric, model, valid_data, tokenizer, poi_finder)  # Im Mr Meeseeks!
     with tqdm(range(max_iters), f"Initial Training...", mininterval=2, ncols=130) as tq:
         for iter_num in tq:
             if step_count <= warmup_iters:

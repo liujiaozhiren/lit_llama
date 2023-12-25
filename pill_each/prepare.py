@@ -130,7 +130,8 @@ def prepare(datas: list, poi_list: list, tokenizer,wl, max_seq_length=256, stage
         sample['poi_mask'] = poi_mask
         sample['raw_spatial'] = raw_spatial_addition
         sample['raw_spatial_labels'] = raw_spatial_addition[1:]
-        sample['spatial_masks'] = torch.all(raw_spatial_addition[1:] == torch.tensor([0.0, 0.0]), dim=1)
+        sample['spatial_masks'] = torch.cat([torch.ones(len(sample['raw_spatial_labels']) - 1, dtype=torch.bool),
+                                             torch.tensor([False], dtype=torch.bool)])
 
         trainable_mask = torch.zeros(sample['language_inputs'].shape[0], dtype=torch.bool)
         trainable_mask[:(spatial_scopes[-1][0]-1)] = True
@@ -172,13 +173,15 @@ class POI_Find_Dict:
             else:
                 self.cat_dict[cat_name].append(poi)
 
-    def find_cat_pos(self, output_cat, output_lon, output_lat, target_poi, normalized=True):
+    def find_cat_pos(self, output_cat, output_lon, output_lat, target_poi, normalized=False):
         # normalized==True: if output is normalized in 0~1 space instead of geo-space
         if output_cat not in self.cat_dict:
             return -1
         poi_list = self.cat_dict[output_cat]
         if normalized:
             lon, lat = self.de_normalize(output_lon, output_lat)
+        else:
+            lon, lat = output_lon, output_lat
         sorted_data = sorted(poi_list, key=lambda x: self.haversine(x[3], x[4], lon, lat))
         # 只保留排序后的 id
         sorted_ids = [item[0] for item in sorted_data]
