@@ -69,7 +69,7 @@ def main(
         # dtype: torch.float32 = torch.float32,
         # quantize: Optional[str] = None,
 ):
-    lora_path = [None, Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")][0]
+    lora_path = [None, Path("../out/pill/backup/lora-without-spatial.pth")][1]
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     fabric.seed_everything(1337 + fabric.global_rank)

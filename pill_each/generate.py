@@ -117,7 +117,7 @@ def generate(
         max_new_tokens: int,
         *,
         max_seq_length: Optional[int] = None,
-        temperature: float = 1.05,
+        temperature: float = 1.0,
         top_k: Optional[int] = None,
         eos_id: Optional[int] = None,
 ) -> (torch.Tensor, torch.Tensor):
@@ -210,7 +210,7 @@ def generate_main(
         checkpoint_path: Path = Path("../checkpoints/lit-llama/7B/lit-llama.pth"),
         spatial=spatial_mark
 ):
-    lora_path = Path("../out/pill/poi/lora-spatial-pill-finetuned.pth")
+    lora_path = Path("../out/pill/backup/lora-without-spatial.pth")
     fabric = L.Fabric(accelerator="cuda", devices=which_devices, precision="bf16-true")
     fabric.launch()
     # fabric.seed_everything(1337 + fabric.global_rank)
@@ -285,9 +285,9 @@ def generate_main(
         else:
             output = not_spatial_generate(model, lang_input, max_new_tokens=12)
             model.reset_cache()
-        output = tokenizer.decode(output.view(-1))
-        print("predicted answer: \n{}".format(output))
-        command = input()
+        sentence = tokenizer.decode(output.view(-1))
+        print("predicted answer: \n{}".format(sentence))
+        # command = input()
 
 
 class WordExtract:
